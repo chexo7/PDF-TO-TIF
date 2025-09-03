@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 GeoRef PDF → GeoTIFF (PyQt6, 3 GCPs Affine)
-• Detailed LOG (terminal, panel, temp file)
 • Robust rasterization (DPI + Max MP + max long side + markups)
 • Wheel zoom, pan, crosshair cursor
 • Visible, draggable markers (max 3)
@@ -16,17 +15,14 @@ NEW:
     - Output options:
         * JPEG (85%, YCbCr)
         * DEFLATE/ZIP (Predictor=2), optional 8-bit Grayscale
+        * TIFF 1-bit (CCITT Group 4)
     - Max long side (px) guard to avoid Google Earth texture limits
-    - Under “Export”: shows estimated size and, after “Compute”, geospatial resolution (°/px and m/px)
 """
 
 import os
 import sys
 import math
-import tempfile
-import logging
 import traceback
-from datetime import datetime
 
 import numpy as np
 from PIL import Image
@@ -42,7 +38,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox, QCheckBox,
     QGraphicsView, QGraphicsScene, QTableWidget, QTableWidgetItem, QHeaderView,
-    QGroupBox, QFormLayout, QStatusBar, QTextEdit, QComboBox,
+    QGroupBox, QFormLayout, QStatusBar, QComboBox,
     QGraphicsEllipseItem, QGraphicsSimpleTextItem
 )
 
@@ -55,40 +51,19 @@ except Exception:
 
 __author__ = "Sergio Acevedo - GHD"
 
-# --------------------------- LOGGING ---------------------------------
-LOG = logging.getLogger("georef")
-LOG.setLevel(logging.DEBUG)
-
-_console_handler = logging.StreamHandler(sys.stdout)
-_console_handler.setLevel(logging.DEBUG)
-_console_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S"))
-LOG.addHandler(_console_handler)
-
-_LOG_DIR = tempfile.gettempdir()
-_LOG_FILE = os.path.join(_LOG_DIR, f"georef_gui_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-_file_handler = logging.FileHandler(_LOG_FILE, encoding="utf-8")
-_file_handler.setLevel(logging.DEBUG)
-_file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
-LOG.addHandler(_file_handler)
-
-# Excepthook: capture unhandled exceptions WITHOUT closing the app
-_def_excepthook = sys.excepthook
-def _log_excepthook(exc_type, exc_value, exc_tb):
+# --------------------------- Errors ----------------------------------
+def _simple_excepthook(exc_type, exc_value, exc_tb):
+    """Show unhandled exceptions in a message box."""
     try:
         tb_txt = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-        LOG.critical("Unhandled exception:\n%s", tb_txt)
-        try:
-            app = QApplication.instance()
-            if app is not None:
-                msg = "An unexpected error occurred. Check the LOG.\n\n" + tb_txt[:1500]
-                QMessageBox.critical(None, "Unhandled error", msg)
-        except Exception:
-            pass
+        app = QApplication.instance()
+        if app is not None:
+            msg = "An unexpected error occurred.\n\n" + tb_txt[:1500]
+            QMessageBox.critical(None, "Unhandled error", msg)
     except Exception:
         pass
-    # Do not call default excepthook (keeps process alive).
-sys.excepthook = _log_excepthook
-LOG.info("Log file: %s", _LOG_FILE)
+
+sys.excepthook = _simple_excepthook
 
 # --------------------------- Rasterization ----------------------------
 class RasterizeError(Exception):
@@ -109,7 +84,6 @@ def _compute_scales_for_limits(rect_width_pt, rect_height_pt, dpi, max_megapixel
     if mp > max_megapixels:
         factor_mp = math.sqrt(max_megapixels / mp)
         eff_scale *= factor_mp
-        LOG.warning("Auto downscale by MP: factor=%.3f (target ≤ %.1f MP)", factor_mp, max_megapixels)
 
     # recompute dims
     w_px = rect_width_pt * eff_scale
@@ -120,7 +94,6 @@ def _compute_scales_for_limits(rect_width_pt, rect_height_pt, dpi, max_megapixel
     if long_side > max_long_side_px:
         factor_ls = max_long_side_px / long_side
         eff_scale *= factor_ls
-        LOG.warning("Auto downscale by long side: factor=%.3f (target ≤ %d px)", factor_ls, max_long_side_px)
 
     # final dims & dpi
     w_px = rect_width_pt * eff_scale
@@ -135,8 +108,6 @@ def pdf_page_to_array_safe(pdf_path, page_index, dpi, max_megapixels=120.0,
     Applies guards for Max MP and Max long side.
     Returns (rgb_array_uint8, eff_dpi)
     """
-    LOG.info("Rasterizing PDF: %s | page: %s | dpi: %s | maxMP: %.1f | maxLongSide: %d | annots: %s",
-             pdf_path, page_index + 1, dpi, max_megapixels, max_long_side_px, include_annots)
 
     if not os.path.isfile(pdf_path):
         raise RasterizeError(f"PDF file not found: {pdf_path}")
@@ -151,12 +122,10 @@ def pdf_page_to_array_safe(pdf_path, page_index, dpi, max_megapixels=120.0,
             raise RasterizeError(f"Invalid page index. PDF has {len(doc)} pages.")
         page = doc.load_page(page_index)
         rect = page.rect  # in points (1/72 in)
-        LOG.debug("PDF size (pt): width=%.2f, height=%.2f", rect.width, rect.height)
 
         eff_scale, out_w, out_h, eff_dpi = _compute_scales_for_limits(
             rect.width, rect.height, dpi, max_megapixels, max_long_side_px
         )
-        LOG.debug("Final raster size: %d x %d px (eff_dpi=%.1f)", out_w, out_h, eff_dpi)
 
         mat = fitz.Matrix(eff_scale, eff_scale)
         try:
@@ -164,8 +133,6 @@ def pdf_page_to_array_safe(pdf_path, page_index, dpi, max_megapixels=120.0,
         except TypeError:
             pix = page.get_pixmap(matrix=mat, alpha=False)
         w, h, n = pix.width, pix.height, pix.n
-        if n not in (3, 4, 1, 2):
-            LOG.warning("Unexpected number of channels from PyMuPDF: %d; forcing RGB", n)
 
         # Build RGB array
         samples = pix.samples  # bytes
@@ -225,7 +192,7 @@ def write_geotiff_from_array(rgb_array, transform, out_tif_path, crs_epsg=4326,
                              tile_size=512):
     """
     Write a GeoTIFF using the given transform and CRS.
-    codec: 'jpeg' or 'deflate'
+    codec: 'jpeg', 'deflate', or 'g4'
     grayscale: if True and codec == 'deflate', writes 1-band 8-bit (MINISBLACK)
     """
     if rgb_array.ndim != 3 or rgb_array.shape[2] != 3:
@@ -235,22 +202,28 @@ def write_geotiff_from_array(rgb_array, transform, out_tif_path, crs_epsg=4326,
 
     H, W, _ = rgb_array.shape
 
-    # Convert to grayscale if requested (for DEFLATE only)
-    if grayscale and codec == 'deflate':
-        # ITU-R BT.601 luma
+    # Convert based on codec and grayscale
+    if codec == 'g4':
+        gray = (0.299 * rgb_array[:, :, 0] +
+                0.587 * rgb_array[:, :, 1] +
+                0.114 * rgb_array[:, :, 2]).astype(np.uint8)
+        bw = (gray > 127).astype(np.uint8)
+        count = 1
+        data = bw[np.newaxis, :, :]
+        photometric = 'MINISBLACK'
+        dtype = bw.dtype
+    elif grayscale and codec == 'deflate':
         gray = (0.299 * rgb_array[:, :, 0] +
                 0.587 * rgb_array[:, :, 1] +
                 0.114 * rgb_array[:, :, 2]).astype(np.uint8)
         count = 1
-        data = gray[np.newaxis, :, :]  # (1, H, W)
+        data = gray[np.newaxis, :, :]
         photometric = 'MINISBLACK'
         dtype = gray.dtype
     else:
-        # 3-band RGB
         data = np.transpose(rgb_array, (2, 0, 1))  # (3, H, W)
         count = 3
         dtype = rgb_array.dtype
-        # photometric depends on codec
         photometric = 'YCbCr' if codec == 'jpeg' else 'RGB'
 
     profile = {
@@ -276,18 +249,20 @@ def write_geotiff_from_array(rgb_array, transform, out_tif_path, crs_epsg=4326,
     elif codec == 'deflate':
         profile.update({
             'compress': 'deflate',
-            'predictor': 2,  # horizontal differencing
-            # zlevel can be set via 'zlevel': 6..9 (rasterio/gdal)
+            'predictor': 2,
             'zlevel': 7
         })
+    elif codec == 'g4':
+        profile.update({
+            'compress': 'ccittfax4',
+            'nbits': 1
+        })
     else:
-        raise ValueError("codec must be 'jpeg' or 'deflate'.")
+        raise ValueError("codec must be 'jpeg', 'deflate', or 'g4'.")
 
     with rasterio.open(out_tif_path, 'w', **profile) as dst:
         dst.write(data)
 
-    LOG.info("GeoTIFF exported → %s (EPSG:%s, codec=%s, grayscale=%s)",
-             out_tif_path, crs_epsg, codec, grayscale)
     return out_tif_path
 
 # --------------------------- Marker items ----------------------------
@@ -399,24 +374,11 @@ class ImageView(QGraphicsView):
         super().mousePressEvent(event)
 
 # --------------------------- Main window -----------------------------
-class QtLogHandler(logging.Handler):
-    """Handler to send logs to the QTextEdit widget."""
-    def __init__(self, widget: QTextEdit):
-        super().__init__()
-        self.widget = widget
-        self.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S"))
-
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            self.widget.append(msg)
-        except Exception:
-            pass
 
 class GeoRefApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("GeoRef PDF → GeoTIFF (3 GCPs, Rot/Scale) + LOG + Zoom/Drag + SPCS NAD83")
+        self.setWindowTitle("GeoRef PDF → GeoTIFF (3 GCPs, Rot/Scale) + Zoom/Drag + SPCS NAD83")
         self.resize(1360, 930)
 
         # State
@@ -448,11 +410,6 @@ class GeoRefApp(QMainWindow):
         self._build_menu_toolbar()
         self.setStatusBar(QStatusBar())
 
-        # Connect LOG to panel
-        self.qt_log_handler = QtLogHandler(self.txt_log)
-        self.qt_log_handler.setLevel(logging.DEBUG)
-        LOG.addHandler(self.qt_log_handler)
-
         # View callbacks
         self.view.left_click_callback = self._handle_left_click
         self.view.right_click_callback = self._handle_right_click
@@ -460,8 +417,6 @@ class GeoRefApp(QMainWindow):
 
         # Populate SPCS NAD83
         self._populate_stateplane_combo()
-
-        LOG.info("==== GeoRef GUI started ====")
 
     # ------------------- UI -------------------
     def _build_ui(self):
@@ -492,6 +447,14 @@ class GeoRefApp(QMainWindow):
         self.spn_maxlong = QSpinBox(); self.spn_maxlong.setRange(2000, 60000); self.spn_maxlong.setValue(15000)  # px
         self.chk_ann = QCheckBox("Include annotations/markups"); self.chk_ann.setChecked(True)
 
+        self.cmb_profile = QComboBox()
+        self.cmb_profile.addItems([
+            "JPEG (85%, YCbCr)",
+            "TIFF DEFLATE (RGB)",
+            "TIFF DEFLATE (8-bit Grayscale)",
+            "TIFF 1-bit (CCITT Group 4)"
+        ])
+
         self.btn_raster = QPushButton("Rasterize page → Image")
         self.btn_raster.clicked.connect(self._rasterize)
 
@@ -501,6 +464,7 @@ class GeoRefApp(QMainWindow):
         f1.addRow(QLabel("Max Megapixels"), self.spn_maxmp)
         f1.addRow(QLabel("Max long side (px)"), self.spn_maxlong)
         f1.addRow(self.chk_ann)
+        f1.addRow(QLabel("Output profile"), self.cmb_profile)
         f1.addRow(self.btn_raster)
         right.addWidget(grp_pdf)
 
@@ -549,42 +513,13 @@ class GeoRefApp(QMainWindow):
         self.btn_compute = QPushButton("Compute transform (includes rotation & scale)")
         self.btn_compute.clicked.connect(self._compute_transform)
 
-        # Output options
-        opt_layout = QFormLayout()
-        self.cmb_codec = QComboBox()
-        self.cmb_codec.addItems(["JPEG (85%, YCbCr)", "DEFLATE (ZIP, Predictor=2)"])
-        self.cmb_codec.currentIndexChanged.connect(self._on_codec_changed)
-
-        self.chk_gray = QCheckBox("Grayscale (8-bit)")
-        self.chk_gray.setChecked(False)
-        self.chk_gray.setEnabled(False)  # enabled when DEFLATE is selected
-
-        opt_layout.addRow(QLabel("Compression"), self.cmb_codec)
-        opt_layout.addRow(self.chk_gray)
-
-        self.lbl_result = QLabel("Result: —")
-        self.lbl_result.setWordWrap(True)
-
         self.btn_export = QPushButton("Export GeoTIFF (EPSG:4326)…")
         self.btn_export.clicked.connect(self._export_geotiff)
         self.btn_export.setEnabled(False)
 
-        self.lbl_export_info = QLabel("Output: —")  # size & resolution info
-        self.lbl_export_info.setWordWrap(True)
-
         v_out.addWidget(self.btn_compute)
-        v_out.addLayout(opt_layout)
-        v_out.addWidget(self.lbl_result)
         v_out.addWidget(self.btn_export)
-        v_out.addWidget(self.lbl_export_info)
         right.addWidget(grp_out)
-
-        # Group: LOG
-        grp_log = QGroupBox("LOG (also in file and console)")
-        v_log = QVBoxLayout(grp_log)
-        self.txt_log = QTextEdit(); self.txt_log.setReadOnly(True)
-        v_log.addWidget(self.txt_log)
-        right.addWidget(grp_log)
 
         right.addStretch()
 
@@ -602,13 +537,11 @@ class GeoRefApp(QMainWindow):
     def _populate_stateplane_combo(self):
         self.cmb_spcs.clear()
         if query_crs_info is None:
-            LOG.warning("pyproj.database.query_crs_info not available. Update pyproj to list EPSG.")
             self.cmb_spcs.addItem("— (pyproj too old, cannot list)", userData=None)
             return
         try:
             infos = list(query_crs_info(auth_name="EPSG"))
         except Exception:
-            LOG.exception("Failed to query EPSG database via pyproj.")
             self.cmb_spcs.addItem("— (EPSG query failed)", userData=None)
             return
 
@@ -642,7 +575,6 @@ class GeoRefApp(QMainWindow):
         self.cmb_spcs.setCurrentIndex(0)
         self._on_spcs_changed()
         self.cmb_spcs.currentIndexChanged.connect(self._on_spcs_changed)
-        LOG.info("Loaded SPCS NAD83 options: %d", len(candidates))
 
     # ------------------- Mode / SPCS events -------------------
     def _on_mode_changed(self, idx):
@@ -666,16 +598,6 @@ class GeoRefApp(QMainWindow):
             return
         self.selected_epsg = int(epsg)
         self.lbl_epsg.setText(f"EPSG: {self.selected_epsg}")
-        LOG.info("Selected CRS: EPSG:%s", self.selected_epsg)
-
-    def _on_codec_changed(self, idx):
-        text = self.cmb_codec.currentText().lower()
-        if "deflate" in text:
-            self.chk_gray.setEnabled(True)
-        else:
-            self.chk_gray.setChecked(False)
-            self.chk_gray.setEnabled(False)
-        self._update_export_info()
 
     # ------------------- Table headers -------------------
     def _set_table_headers_for_latlon(self):
@@ -691,14 +613,12 @@ class GeoRefApp(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Select PDF", "", "PDF (*.pdf)")
         if not path:
             return
-        LOG.info("Selected PDF: %s", path)
         try:
             doc = fitz.open(path)
             self.page_count = len(doc)
             doc.close()
         except Exception:
-            LOG.exception("Could not open PDF")
-            QMessageBox.critical(self, "Error", "Could not open the PDF. Check the LOG.")
+            QMessageBox.critical(self, "Error", "Could not open the PDF.")
             return
 
         self.pdf_path = path
@@ -716,7 +636,6 @@ class GeoRefApp(QMainWindow):
         self.img_h = 0
         self._last_pdf_for_raster = None
         self._last_page_idx_for_raster = None
-        self._update_export_info()
 
     def _rasterize(self):
         if not self.pdf_path:
@@ -747,15 +666,13 @@ class GeoRefApp(QMainWindow):
                 v2 = self.tbl.item(r, 2).text().strip() if self.tbl.item(r, 2) else ""
                 v3 = self.tbl.item(r, 3).text().strip() if self.tbl.item(r, 3) else ""
                 saved_vals_col2_col3.append((v2, v3))
-            LOG.info("Preserving %d points for relocation after re-rasterization.", len(saved_positions))
 
         try:
             rgb_arr, eff_dpi = pdf_page_to_array_safe(
                 self.pdf_path, page_idx, dpi, max_mp, include_ann, max_long
             )
         except Exception:
-            LOG.exception("Rasterization failed")
-            QMessageBox.critical(self, "Error", "Rasterization failed. Check the LOG for details.")
+            QMessageBox.critical(self, "Error", "Rasterization failed.")
             return
 
         try:
@@ -776,13 +693,11 @@ class GeoRefApp(QMainWindow):
             # Reset output state
             self.transform = None
             self.btn_export.setEnabled(False)
-            self.lbl_result.setText("Result: —")
 
             if same_target and saved_positions:
                 # Reposition proportionally
                 sx = new_w / max(1.0, old_w)
                 sy = new_h / max(1.0, old_h)
-                LOG.info("Repositioning points with scale sx=%.5f, sy=%.5f", sx, sy)
 
                 # Clear lists (scene cleared by set_image)
                 self.markers = []
@@ -795,7 +710,6 @@ class GeoRefApp(QMainWindow):
                         v2, v3 = saved_vals_col2_col3[i]
                         self.tbl.item(i, 2).setText(v2)
                         self.tbl.item(i, 3).setText(v3)
-                LOG.info("Points relocated and values preserved.")
             else:
                 self._clear_points()
 
@@ -803,12 +717,8 @@ class GeoRefApp(QMainWindow):
                 f"Page rasterized at {eff_dpi:.1f} DPI ({new_w}x{new_h}px)",
                 6000
             )
-            LOG.info("Image loaded into view (array)")
         except Exception:
-            LOG.exception("Error showing the rasterized image")
-            QMessageBox.critical(self, "Error", "Rasterized but could not show the image. Check the LOG.")
-
-        self._update_export_info()
+            QMessageBox.critical(self, "Error", "Rasterized but could not show the image.")
 
     # ------------------- Markers interaction -------------------
     def _handle_mouse_move(self, x, y):
@@ -837,7 +747,6 @@ class GeoRefApp(QMainWindow):
 
     def _handle_left_click(self, x, y):
         self._add_marker(x, y)
-        self._update_export_info()
 
     def _handle_right_click(self, x, y):
         tol = self._scene_tolerance(px=14)
@@ -846,7 +755,6 @@ class GeoRefApp(QMainWindow):
             self.statusBar().showMessage("No nearby marker to delete.")
             return
         self._delete_marker(idx)
-        self._update_export_info()
 
     def _add_marker(self, x, y):
         idx = len(self.markers)
@@ -868,7 +776,6 @@ class GeoRefApp(QMainWindow):
         self.tbl.setItem(r, 1, it_y)
         self.tbl.setItem(r, 2, QTableWidgetItem(""))  # Lat / X
         self.tbl.setItem(r, 3, QTableWidgetItem(""))  # Lon / Y
-        LOG.debug("Point #%d added at col=%.3f, row=%.3f (mode=%s)", idx+1, x, y, self.input_mode)
 
     def _delete_marker(self, idx):
         if not (0 <= idx < len(self.markers)):
@@ -900,9 +807,7 @@ class GeoRefApp(QMainWindow):
         # Invalidate transform/export
         self.transform = None
         self.btn_export.setEnabled(False)
-        self.lbl_result.setText("Result: —")
         self.statusBar().showMessage(f"Marker deleted. Now {len(self.markers)} point(s) remain.")
-        LOG.info("Marker deleted. Remaining: %d", len(self.markers))
 
     def _marker_moved(self, index, x, y):
         if 0 <= index < self.tbl.rowCount():
@@ -920,7 +825,6 @@ class GeoRefApp(QMainWindow):
         self.markers = []
         self.transform = None
         self.btn_export.setEnabled(False)
-        self.lbl_result.setText("Result: —")
 
     # ------------------- Read GCPs -------------------
     def _read_gcps_latlon(self):
@@ -980,28 +884,11 @@ class GeoRefApp(QMainWindow):
 
             transform, rms_lon, rms_lat, ang_deg = compute_affine_transform(colrow, lons, lats)
         except Exception:
-            LOG.exception("Error computing transform")
-            QMessageBox.critical(self, "Error", "Could not compute the transform. Check the LOG.")
+            QMessageBox.critical(self, "Error", "Could not compute the transform.")
             return
 
         self.transform = transform
         self.btn_export.setEnabled(True)
-        a, b, c, d, e, f = transform.a, transform.b, transform.c, transform.d, transform.e, transform.f
-        txt = (
-            "Result:\n"
-            f"  Transform (Affine):\n"
-            f"    lon = {a:.8f}*col + {b:.8f}*row + {c:.8f}\n"
-            f"    lat = {d:.8f}*col + {e:.8f}*row + {f:.8f}\n"
-            f"  RMS lon: {rms_lon:.8e}°, RMS lat: {rms_lat:.8e}°\n"
-            f"  Approx rotation (image x-axis → geo): {ang_deg:.3f}°"
-        )
-        self.lbl_result.setText(txt)
-       
-        LOG.info("Affine transform ready. Rot≈ %.3f° | RMS: lon=%.2e°, lat=%.2e°",
-                 ang_deg, rms_lon, rms_lat)
-
-        # Update export info (geo resolution)
-        self._update_export_info()
 
     def _export_geotiff(self):
         if self.transform is None:
@@ -1023,58 +910,25 @@ class GeoRefApp(QMainWindow):
             return
 
         try:
-            codec = 'jpeg' if self.cmb_codec.currentIndex() == 0 else 'deflate'
-            grayscale = self.chk_gray.isChecked()
+            profile_idx = self.cmb_profile.currentIndex()
+            if profile_idx == 0:
+                codec, grayscale = 'jpeg', False
+            elif profile_idx == 1:
+                codec, grayscale = 'deflate', False
+            elif profile_idx == 2:
+                codec, grayscale = 'deflate', True
+            else:
+                codec, grayscale = 'g4', True
             write_geotiff_from_array(
                 self._rgb_array, self.transform, out_path,
                 crs_epsg=4326, codec=codec, grayscale=grayscale
             )
             QMessageBox.information(
                 self, "Done",
-                f"GeoTIFF created:\n{out_path}\n\nLog: {_LOG_FILE}"
+                f"GeoTIFF created:\n{out_path}"
             )
         except Exception:
-            LOG.exception("Error exporting GeoTIFF")
-            QMessageBox.critical(self, "Error", "Could not write the GeoTIFF. Check the LOG.")
-
-    # ------------------- Export info -------------------
-    def _estimate_tif_sizes_mb(self, w, h, bands=3, dtype_bytes=1):
-        """Return (uncompressed, est_min, est_max) in MiB, LZW ~40–80%."""
-        uncompressed = (w * h * bands * dtype_bytes) / (1024 * 1024)
-        min_est = uncompressed * 0.40
-        max_est = uncompressed * 0.80
-        return uncompressed, min_est, max_est
-
-    def _update_export_info(self):
-        if self._pixmap is None:
-            self.lbl_export_info.setText("Output: —")
-            return
-        w = self._pixmap.width()
-        h = self._pixmap.height()
-        bands = 3
-        if self.cmb_codec.currentIndex() == 1 and self.chk_gray.isChecked():
-            bands = 1
-        uncmp, est_min, est_max = self._estimate_tif_sizes_mb(w, h, bands=bands)
-        txt = (f"Output (image): {w}×{h} px, {bands} band(s), uint8.\n"
-               f"Estimated GeoTIFF size: ~{est_min:.1f}–{est_max:.1f} MiB "
-               f"(raw ≈ {uncmp:.1f} MiB).")
-
-        if self.transform is not None:
-            a, b, c, d, e, f = self.transform.a, self.transform.b, self.transform.c, self.transform.d, self.transform.e, self.transform.f
-            res_x_deg = math.hypot(a, d)
-            res_y_deg = math.hypot(b, e)
-            col_c = w / 2.0
-            row_c = h / 2.0
-            lon_c = a * col_c + b * row_c + c
-            lat_c = d * col_c + e * row_c + f
-            m_per_deg_lat = 111_320.0
-            m_per_deg_lon = 111_320.0 * math.cos(math.radians(lat_c))
-            res_x_m = math.hypot(a * m_per_deg_lon, d * m_per_deg_lat)
-            res_y_m = math.hypot(b * m_per_deg_lon, e * m_per_deg_lat)
-            txt += (f"\nApprox geospatial resolution: "
-                    f"{res_x_deg:.6f}°/px × {res_y_deg:.6f}°/px  |  "
-                    f"{res_x_m:.2f} m/px × {res_y_m:.2f} m/px (lat≈{lat_c:.5f}°).")
-        self.lbl_export_info.setText(txt)
+            QMessageBox.critical(self, "Error", "Could not write the GeoTIFF.")
 
 # --------------------------- main ------------------------------------
 def main():
