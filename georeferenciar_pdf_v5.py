@@ -14,9 +14,10 @@ NEW:
     - No lossy JPG intermediate: rasterizes PDF → NumPy array (lossless from PyMuPDF)
     - Output options:
         * JPEG (100%, YCbCr)
-        * DEFLATE (8-bit Grayscale)
-        * DEFLATE (Color)
-        * JPEG2000
+        * For CAD in B/W (DEFLATE 8-bit Grayscale)
+        * For CAD in colour (DEFLATE Color)
+        * For Images (JPEG2000)
+        * TIFF 1-bit (CCITT Group 4)
 """
 
 import os
@@ -212,7 +213,7 @@ def write_geotiff_from_array(rgb_array, transform, out_tif_path, crs_epsg=4326,
                              tile_size=512):
     """
     Write a GeoTIFF using the given transform and CRS.
-    codec: 'jpeg', 'deflate' or 'jpeg2000'
+    codec: 'jpeg', 'deflate', 'jpeg2000' or 'ccittg4'
     grayscale: if True and codec == 'deflate', writes 1-band 8-bit (MINISBLACK)
     """
     if rgb_array.ndim != 3 or rgb_array.shape[2] != 3:
@@ -223,7 +224,17 @@ def write_geotiff_from_array(rgb_array, transform, out_tif_path, crs_epsg=4326,
     H, W, _ = rgb_array.shape
 
     # Convert to grayscale if requested
-    if grayscale and codec == 'deflate':
+    if codec == 'ccittg4':
+        # Convert to bilevel (1-bit) using threshold
+        gray = (0.299 * rgb_array[:, :, 0] +
+                0.587 * rgb_array[:, :, 1] +
+                0.114 * rgb_array[:, :, 2]).astype(np.uint8)
+        bw = (gray > 127).astype(np.uint8) * 255
+        count = 1
+        data = bw[np.newaxis, :, :]
+        photometric = 'MINISWHITE'
+        dtype = bw.dtype
+    elif grayscale and codec == 'deflate':
         # ITU-R BT.601 luma
         gray = (0.299 * rgb_array[:, :, 0] +
                 0.587 * rgb_array[:, :, 1] +
@@ -270,8 +281,13 @@ def write_geotiff_from_array(rgb_array, transform, out_tif_path, crs_epsg=4326,
         profile.update({
             'compress': 'jpeg2000'
         })
+    elif codec == 'ccittg4':
+        profile.update({
+            'compress': 'ccittfax4',
+            'nbits': 1
+        })
     else:
-        raise ValueError("codec must be 'jpeg', 'deflate' or 'jpeg2000'.")
+        raise ValueError("codec must be 'jpeg', 'deflate', 'jpeg2000' or 'ccittg4'.")
 
     with rasterio.open(out_tif_path, 'w', **profile) as dst:
         dst.write(data)
@@ -460,16 +476,28 @@ class GeoRefApp(QMainWindow):
         # Raster params
         self.spn_page = QSpinBox(); self.spn_page.setMinimum(1); self.spn_page.setMaximum(1); self.spn_page.setValue(1)
         self.spn_dpi = QSpinBox(); self.spn_dpi.setRange(72, 1200); self.spn_dpi.setValue(300)
-        self.spn_maxmp = QSpinBox(); self.spn_maxmp.setRange(10, 600); self.spn_maxmp.setValue(120)  # MP
+        self.max_megapixels = 80  # hidden MP cap
         self.chk_ann = QCheckBox("Include annotations/markups"); self.chk_ann.setChecked(True)
+
+        self.cmb_codec = QComboBox()
+        self.cmb_codec.addItems([
+            "JPEG (100%, YCbCr)",
+            "For CAD in B/W",
+            "For CAD in colour",
+            "For Images",
+            "TIFF 1-bit (CCITT G4)"
+        ])
+        self.cmb_codec.model().item(0).setEnabled(False)
+        self.cmb_codec.setCurrentIndex(1)
+        self.cmb_codec.currentIndexChanged.connect(self._update_export_info)
 
         self.btn_raster = QPushButton("Rasterize page → Image")
         self.btn_raster.clicked.connect(self._rasterize)
 
         f1.addRow(self.lbl_pdf, self.btn_pdf)
+        f1.addRow(QLabel("File Type"), self.cmb_codec)
         f1.addRow(QLabel("Page"), self.spn_page)
         f1.addRow(QLabel("DPI"), self.spn_dpi)
-        f1.addRow(QLabel("Max Megapixels"), self.spn_maxmp)
         f1.addRow(self.chk_ann)
         f1.addRow(self.btn_raster)
         right.addWidget(grp_pdf)
@@ -516,44 +544,25 @@ class GeoRefApp(QMainWindow):
         grp_out = QGroupBox("Transform & Output")
         v_out = QVBoxLayout(grp_out)
 
-        self.btn_compute = QPushButton("Compute transform (includes rotation & scale)")
-        self.btn_compute.clicked.connect(self._compute_transform)
-
-        # Output options
-        opt_layout = QFormLayout()
-        self.cmb_codec = QComboBox()
-        self.cmb_codec.addItems([
-            "JPEG (100%, YCbCr)",
-            "DEFLATE (8-bit Grayscale)",
-            "DEFLATE (Color)",
-            "JPEG2000"
-        ])
-        self.cmb_codec.currentIndexChanged.connect(self._update_export_info)
-
-        opt_layout.addRow(QLabel("Compression"), self.cmb_codec)
-
         self.lbl_result = QLabel("Result: —")
         self.lbl_result.setWordWrap(True)
-
-        self.btn_export = QPushButton("Export GeoTIFF (EPSG:4326)…")
-        self.btn_export.clicked.connect(self._export_geotiff)
-        self.btn_export.setEnabled(False)
 
         self.lbl_export_info = QLabel("Output: —")  # size & resolution info
         self.lbl_export_info.setWordWrap(True)
 
-        v_out.addWidget(self.btn_compute)
-        v_out.addLayout(opt_layout)
-        # self.lbl_result hidden: not added to layout
+        self.btn_export = QPushButton("Export to GeoTIFF")
+        self.btn_export.clicked.connect(self._export_geotiff)
+        self.btn_export.setEnabled(False)
+
         v_out.addWidget(self.btn_export)
-        # self.lbl_export_info hidden: not added to layout
         right.addWidget(grp_out)
         right.addStretch()
+        self._update_export_info()
 
     def _build_menu_toolbar(self):
         act_open = QAction("Open PDF…", self); act_open.triggered.connect(self._choose_pdf)
         act_raster = QAction("Rasterize", self); act_raster.triggered.connect(self._rasterize)
-        act_export = QAction("Export GeoTIFF…", self); act_export.triggered.connect(self._export_geotiff)
+        act_export = QAction("Export to GeoTIFF…", self); act_export.triggered.connect(self._export_geotiff)
 
         tb = self.addToolBar("Main")
         tb.addAction(act_open)
@@ -660,7 +669,6 @@ class GeoRefApp(QMainWindow):
         self.spn_page.setValue(1)
         self.view.scene.clear()
         self._clear_points()
-        self.btn_export.setEnabled(False)
         self._rgb_array = None
         self._pil_img = None
         self._qimage = None
@@ -678,7 +686,7 @@ class GeoRefApp(QMainWindow):
 
         page_idx = self.spn_page.value() - 1
         dpi = self.spn_dpi.value()
-        max_mp = float(self.spn_maxmp.value())
+        max_mp = float(self.max_megapixels)
         include_ann = self.chk_ann.isChecked()
 
         # Are we re-rasterizing same PDF/page?
@@ -727,7 +735,6 @@ class GeoRefApp(QMainWindow):
 
             # Reset output state
             self.transform = None
-            self.btn_export.setEnabled(False)
             self.lbl_result.setText("Result: —")
 
             if same_target and saved_positions:
@@ -789,7 +796,6 @@ class GeoRefApp(QMainWindow):
 
     def _handle_left_click(self, x, y):
         self._add_marker(x, y)
-        self._update_export_info()
 
     def _handle_right_click(self, x, y):
         tol = self._scene_tolerance(px=14)
@@ -821,6 +827,7 @@ class GeoRefApp(QMainWindow):
         self.tbl.setItem(r, 2, QTableWidgetItem(""))  # Lat / X
         self.tbl.setItem(r, 3, QTableWidgetItem(""))  # Lon / Y
         LOG.debug("Point #%d added at col=%.3f, row=%.3f (mode=%s)", idx+1, x, y, self.input_mode)
+        self._update_export_info()
 
     def _delete_marker(self, idx):
         if not (0 <= idx < len(self.markers)):
@@ -851,7 +858,6 @@ class GeoRefApp(QMainWindow):
 
         # Invalidate transform/export
         self.transform = None
-        self.btn_export.setEnabled(False)
         self.lbl_result.setText("Result: —")
         self.statusBar().showMessage(f"Marker deleted. Now {len(self.markers)} point(s) remain.")
         LOG.info("Marker deleted. Remaining: %d", len(self.markers))
@@ -871,8 +877,8 @@ class GeoRefApp(QMainWindow):
                 pass
         self.markers = []
         self.transform = None
-        self.btn_export.setEnabled(False)
         self.lbl_result.setText("Result: —")
+        self._update_export_info()
 
     # ------------------- Read GCPs -------------------
     def _read_gcps_latlon(self):
@@ -937,7 +943,6 @@ class GeoRefApp(QMainWindow):
             return
 
         self.transform = transform
-        self.btn_export.setEnabled(True)
         a, b, c, d, e, f = transform.a, transform.b, transform.c, transform.d, transform.e, transform.f
         txt = (
             "Result:\n"
@@ -956,11 +961,16 @@ class GeoRefApp(QMainWindow):
         self._update_export_info()
 
     def _export_geotiff(self):
-        if self.transform is None:
-            QMessageBox.warning(self, "Attention", "Compute the transform first.")
-            return
         if self._rgb_array is None:
-            QMessageBox.warning(self, "Attention", "No rasterized image available.")
+            QMessageBox.warning(self, "Attention", "Rasterize a PDF page first.")
+            return
+        if len(self.markers) != 3:
+            QMessageBox.warning(self, "Attention", "Add exactly 3 points and complete the table.")
+            return
+
+        # Compute transform before exporting
+        self._compute_transform()
+        if self.transform is None:
             return
 
         base_sug = "georef.tif"
@@ -985,8 +995,11 @@ class GeoRefApp(QMainWindow):
             elif idx == 2:
                 codec = 'deflate'
                 grayscale = False
-            else:
+            elif idx == 3:
                 codec = 'jpeg2000'
+                grayscale = False
+            else:
+                codec = 'ccittg4'
                 grayscale = False
 
             write_geotiff_from_array(
@@ -1012,14 +1025,20 @@ class GeoRefApp(QMainWindow):
     def _update_export_info(self):
         if self._pixmap is None:
             self.lbl_export_info.setText("Output: —")
+            self.btn_export.setEnabled(False)
             return
         w = self._pixmap.width()
         h = self._pixmap.height()
+        idx = self.cmb_codec.currentIndex()
         bands = 3
-        if self.cmb_codec.currentIndex() == 1:
+        dtype_bytes = 1
+        if idx in (1, 4):
             bands = 1
-        uncmp, est_min, est_max = self._estimate_tif_sizes_mb(w, h, bands=bands)
-        txt = (f"Output (image): {w}×{h} px, {bands} band(s), uint8.\n"
+        if idx == 4:
+            dtype_bytes = 0.125  # 1-bit
+        uncmp, est_min, est_max = self._estimate_tif_sizes_mb(w, h, bands=bands, dtype_bytes=dtype_bytes)
+        bit_txt = "1-bit" if idx == 4 else "uint8"
+        txt = (f"Output (image): {w}×{h} px, {bands} band(s), {bit_txt}.\n"
                f"Estimated GeoTIFF size: ~{est_min:.1f}–{est_max:.1f} MiB "
                f"(raw ≈ {uncmp:.1f} MiB).")
 
@@ -1039,6 +1058,7 @@ class GeoRefApp(QMainWindow):
                     f"{res_x_deg:.6f}°/px × {res_y_deg:.6f}°/px  |  "
                     f"{res_x_m:.2f} m/px × {res_y_m:.2f} m/px (lat≈{lat_c:.5f}°).")
         self.lbl_export_info.setText(txt)
+        self.btn_export.setEnabled(self._rgb_array is not None and len(self.markers) == 3)
 
 # --------------------------- main ------------------------------------
 def main():
