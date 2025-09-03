@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 GeoRef PDF → GeoTIFF (PyQt6, 3 GCPs Affine)
-• Detailed LOG (terminal, panel, temp file)
 • Robust rasterization (DPI + Max MP + max long side + markups)
 • Wheel zoom, pan, crosshair cursor
 • Visible, draggable markers (max 3)
@@ -16,8 +15,8 @@ NEW:
     - Output options:
         * JPEG (85%, YCbCr)
         * DEFLATE/ZIP (Predictor=2), optional 8-bit Grayscale
+        * TIFF 1-bit (CCITT Group 4)
     - Max long side (px) guard to avoid Google Earth texture limits
-    - Under “Export”: shows estimated size and, after “Compute”, geospatial resolution (°/px and m/px)
 """
 
 import os
@@ -42,7 +41,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox, QCheckBox,
     QGraphicsView, QGraphicsScene, QTableWidget, QTableWidgetItem, QHeaderView,
-    QGroupBox, QFormLayout, QStatusBar, QTextEdit, QComboBox,
+    QGroupBox, QFormLayout, QStatusBar, QComboBox,
     QGraphicsEllipseItem, QGraphicsSimpleTextItem
 )
 
@@ -80,7 +79,7 @@ def _log_excepthook(exc_type, exc_value, exc_tb):
         try:
             app = QApplication.instance()
             if app is not None:
-                msg = "An unexpected error occurred. Check the LOG.\n\n" + tb_txt[:1500]
+                msg = "An unexpected error occurred.\n\n" + tb_txt[:1500]
                 QMessageBox.critical(None, "Unhandled error", msg)
         except Exception:
             pass
@@ -88,7 +87,6 @@ def _log_excepthook(exc_type, exc_value, exc_tb):
         pass
     # Do not call default excepthook (keeps process alive).
 sys.excepthook = _log_excepthook
-LOG.info("Log file: %s", _LOG_FILE)
 
 # --------------------------- Rasterization ----------------------------
 class RasterizeError(Exception):
@@ -225,7 +223,7 @@ def write_geotiff_from_array(rgb_array, transform, out_tif_path, crs_epsg=4326,
                              tile_size=512):
     """
     Write a GeoTIFF using the given transform and CRS.
-    codec: 'jpeg' or 'deflate'
+    codec: 'jpeg', 'deflate' or 'ccittg4'
     grayscale: if True and codec == 'deflate', writes 1-band 8-bit (MINISBLACK)
     """
     if rgb_array.ndim != 3 or rgb_array.shape[2] != 3:
@@ -236,7 +234,16 @@ def write_geotiff_from_array(rgb_array, transform, out_tif_path, crs_epsg=4326,
     H, W, _ = rgb_array.shape
 
     # Convert to grayscale if requested (for DEFLATE only)
-    if grayscale and codec == 'deflate':
+    if codec == 'ccittg4':
+        gray = (0.299 * rgb_array[:, :, 0] +
+                0.587 * rgb_array[:, :, 1] +
+                0.114 * rgb_array[:, :, 2]).astype(np.uint8)
+        bw = (gray > 127).astype(np.uint8)
+        count = 1
+        data = bw[np.newaxis, :, :]
+        photometric = 'MINISBLACK'
+        dtype = bw.dtype
+    elif grayscale and codec == 'deflate':
         # ITU-R BT.601 luma
         gray = (0.299 * rgb_array[:, :, 0] +
                 0.587 * rgb_array[:, :, 1] +
@@ -280,8 +287,13 @@ def write_geotiff_from_array(rgb_array, transform, out_tif_path, crs_epsg=4326,
             # zlevel can be set via 'zlevel': 6..9 (rasterio/gdal)
             'zlevel': 7
         })
+    elif codec == 'ccittg4':
+        profile.update({
+            'compress': 'ccittfax4',
+            'nbits': 1
+        })
     else:
-        raise ValueError("codec must be 'jpeg' or 'deflate'.")
+        raise ValueError("codec must be 'jpeg', 'deflate' or 'ccittg4'.")
 
     with rasterio.open(out_tif_path, 'w', **profile) as dst:
         dst.write(data)
@@ -399,24 +411,11 @@ class ImageView(QGraphicsView):
         super().mousePressEvent(event)
 
 # --------------------------- Main window -----------------------------
-class QtLogHandler(logging.Handler):
-    """Handler to send logs to the QTextEdit widget."""
-    def __init__(self, widget: QTextEdit):
-        super().__init__()
-        self.widget = widget
-        self.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S"))
-
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            self.widget.append(msg)
-        except Exception:
-            pass
 
 class GeoRefApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("GeoRef PDF → GeoTIFF (3 GCPs, Rot/Scale) + LOG + Zoom/Drag + SPCS NAD83")
+        self.setWindowTitle("GeoRef PDF → GeoTIFF (3 GCPs, Rot/Scale) + Zoom/Drag + SPCS NAD83")
         self.resize(1360, 930)
 
         # State
@@ -447,11 +446,6 @@ class GeoRefApp(QMainWindow):
         self._build_ui()
         self._build_menu_toolbar()
         self.setStatusBar(QStatusBar())
-
-        # Connect LOG to panel
-        self.qt_log_handler = QtLogHandler(self.txt_log)
-        self.qt_log_handler.setLevel(logging.DEBUG)
-        LOG.addHandler(self.qt_log_handler)
 
         # View callbacks
         self.view.left_click_callback = self._handle_left_click
@@ -552,7 +546,11 @@ class GeoRefApp(QMainWindow):
         # Output options
         opt_layout = QFormLayout()
         self.cmb_codec = QComboBox()
-        self.cmb_codec.addItems(["JPEG (85%, YCbCr)", "DEFLATE (ZIP, Predictor=2)"])
+        self.cmb_codec.addItems([
+            "JPEG (85%, YCbCr)",
+            "DEFLATE (ZIP, Predictor=2)",
+            "TIFF 1-bit (CCITT Group 4)"
+        ])
         self.cmb_codec.currentIndexChanged.connect(self._on_codec_changed)
 
         self.chk_gray = QCheckBox("Grayscale (8-bit)")
@@ -574,18 +572,10 @@ class GeoRefApp(QMainWindow):
 
         v_out.addWidget(self.btn_compute)
         v_out.addLayout(opt_layout)
-        v_out.addWidget(self.lbl_result)
+        # self.lbl_result hidden: not added to layout
         v_out.addWidget(self.btn_export)
-        v_out.addWidget(self.lbl_export_info)
+        # self.lbl_export_info hidden: not added to layout
         right.addWidget(grp_out)
-
-        # Group: LOG
-        grp_log = QGroupBox("LOG (also in file and console)")
-        v_log = QVBoxLayout(grp_log)
-        self.txt_log = QTextEdit(); self.txt_log.setReadOnly(True)
-        v_log.addWidget(self.txt_log)
-        right.addWidget(grp_log)
-
         right.addStretch()
 
     def _build_menu_toolbar(self):
@@ -669,8 +659,7 @@ class GeoRefApp(QMainWindow):
         LOG.info("Selected CRS: EPSG:%s", self.selected_epsg)
 
     def _on_codec_changed(self, idx):
-        text = self.cmb_codec.currentText().lower()
-        if "deflate" in text:
+        if idx == 1:
             self.chk_gray.setEnabled(True)
         else:
             self.chk_gray.setChecked(False)
@@ -698,7 +687,7 @@ class GeoRefApp(QMainWindow):
             doc.close()
         except Exception:
             LOG.exception("Could not open PDF")
-            QMessageBox.critical(self, "Error", "Could not open the PDF. Check the LOG.")
+            QMessageBox.critical(self, "Error", "Could not open the PDF.")
             return
 
         self.pdf_path = path
@@ -755,7 +744,7 @@ class GeoRefApp(QMainWindow):
             )
         except Exception:
             LOG.exception("Rasterization failed")
-            QMessageBox.critical(self, "Error", "Rasterization failed. Check the LOG for details.")
+            QMessageBox.critical(self, "Error", "Rasterization failed.")
             return
 
         try:
@@ -806,7 +795,7 @@ class GeoRefApp(QMainWindow):
             LOG.info("Image loaded into view (array)")
         except Exception:
             LOG.exception("Error showing the rasterized image")
-            QMessageBox.critical(self, "Error", "Rasterized but could not show the image. Check the LOG.")
+            QMessageBox.critical(self, "Error", "Rasterized but could not show the image.")
 
         self._update_export_info()
 
@@ -981,7 +970,7 @@ class GeoRefApp(QMainWindow):
             transform, rms_lon, rms_lat, ang_deg = compute_affine_transform(colrow, lons, lats)
         except Exception:
             LOG.exception("Error computing transform")
-            QMessageBox.critical(self, "Error", "Could not compute the transform. Check the LOG.")
+            QMessageBox.critical(self, "Error", "Could not compute the transform.")
             return
 
         self.transform = transform
@@ -1023,19 +1012,28 @@ class GeoRefApp(QMainWindow):
             return
 
         try:
-            codec = 'jpeg' if self.cmb_codec.currentIndex() == 0 else 'deflate'
-            grayscale = self.chk_gray.isChecked()
+            idx = self.cmb_codec.currentIndex()
+            if idx == 0:
+                codec = 'jpeg'
+                grayscale = False
+            elif idx == 1:
+                codec = 'deflate'
+                grayscale = self.chk_gray.isChecked()
+            else:
+                codec = 'ccittg4'
+                grayscale = False
+
             write_geotiff_from_array(
                 self._rgb_array, self.transform, out_path,
                 crs_epsg=4326, codec=codec, grayscale=grayscale
             )
             QMessageBox.information(
                 self, "Done",
-                f"GeoTIFF created:\n{out_path}\n\nLog: {_LOG_FILE}"
+                f"GeoTIFF created:\n{out_path}"
             )
         except Exception:
             LOG.exception("Error exporting GeoTIFF")
-            QMessageBox.critical(self, "Error", "Could not write the GeoTIFF. Check the LOG.")
+            QMessageBox.critical(self, "Error", "Could not write the GeoTIFF.")
 
     # ------------------- Export info -------------------
     def _estimate_tif_sizes_mb(self, w, h, bands=3, dtype_bytes=1):
@@ -1053,6 +1051,8 @@ class GeoRefApp(QMainWindow):
         h = self._pixmap.height()
         bands = 3
         if self.cmb_codec.currentIndex() == 1 and self.chk_gray.isChecked():
+            bands = 1
+        elif self.cmb_codec.currentIndex() == 2:
             bands = 1
         uncmp, est_min, est_max = self._estimate_tif_sizes_mb(w, h, bands=bands)
         txt = (f"Output (image): {w}×{h} px, {bands} band(s), uint8.\n"
