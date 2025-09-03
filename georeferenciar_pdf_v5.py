@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 GeoRef PDF → GeoTIFF (PyQt6, 3 GCPs Affine)
-• Robust rasterization (DPI + Max MP + max long side + markups)
+• Robust rasterization (DPI + Max MP + markups)
 • Wheel zoom, pan, crosshair cursor
 • Visible, draggable markers (max 3)
 • Left-click = add point, right-click = delete nearest
@@ -13,10 +13,10 @@ GeoRef PDF → GeoTIFF (PyQt6, 3 GCPs Affine)
 NEW:
     - No lossy JPG intermediate: rasterizes PDF → NumPy array (lossless from PyMuPDF)
     - Output options:
-        * JPEG (85%, YCbCr)
-        * DEFLATE/ZIP (Predictor=2), optional 8-bit Grayscale
-        * TIFF 1-bit (CCITT Group 4)
-    - Max long side (px) guard to avoid Google Earth texture limits
+        * JPEG (100%, YCbCr)
+        * DEFLATE (8-bit Grayscale)
+        * DEFLATE (Color)
+        * JPEG2000
 """
 
 import os
@@ -92,33 +92,22 @@ sys.excepthook = _log_excepthook
 class RasterizeError(Exception):
     pass
 
-def _compute_scales_for_limits(rect_width_pt, rect_height_pt, dpi, max_megapixels=120.0, max_long_side_px=15000):
+def _compute_scales_for_limits(rect_width_pt, rect_height_pt, dpi, max_megapixels=120.0):
     """
-    Compute effective scale to satisfy both Max MP and Max long side constraints.
+    Compute effective scale to satisfy the Max MP constraint.
     Returns (eff_scale, out_w_px, out_h_px, eff_dpi)
     """
     base_scale = max(dpi, 72) / 72.0
     w_px = rect_width_pt * base_scale
     h_px = rect_height_pt * base_scale
 
-    # 1) cap by megapixels
+    # cap by megapixels
     mp = (w_px * h_px) / 1e6
     eff_scale = base_scale
     if mp > max_megapixels:
         factor_mp = math.sqrt(max_megapixels / mp)
         eff_scale *= factor_mp
         LOG.warning("Auto downscale by MP: factor=%.3f (target ≤ %.1f MP)", factor_mp, max_megapixels)
-
-    # recompute dims
-    w_px = rect_width_pt * eff_scale
-    h_px = rect_height_pt * eff_scale
-
-    # 2) cap by long side
-    long_side = max(w_px, h_px)
-    if long_side > max_long_side_px:
-        factor_ls = max_long_side_px / long_side
-        eff_scale *= factor_ls
-        LOG.warning("Auto downscale by long side: factor=%.3f (target ≤ %d px)", factor_ls, max_long_side_px)
 
     # final dims & dpi
     w_px = rect_width_pt * eff_scale
@@ -127,14 +116,14 @@ def _compute_scales_for_limits(rect_width_pt, rect_height_pt, dpi, max_megapixel
     return eff_scale, int(round(w_px)), int(round(h_px)), eff_dpi
 
 def pdf_page_to_array_safe(pdf_path, page_index, dpi, max_megapixels=120.0,
-                           include_annots=True, max_long_side_px=15000):
+                           include_annots=True):
     """
     Rasterize a PDF page to a NumPy array (H, W, 3) in RGB, losslessly from PyMuPDF.
-    Applies guards for Max MP and Max long side.
+    Applies guard for Max MP.
     Returns (rgb_array_uint8, eff_dpi)
     """
-    LOG.info("Rasterizing PDF: %s | page: %s | dpi: %s | maxMP: %.1f | maxLongSide: %d | annots: %s",
-             pdf_path, page_index + 1, dpi, max_megapixels, max_long_side_px, include_annots)
+    LOG.info("Rasterizing PDF: %s | page: %s | dpi: %s | maxMP: %.1f | annots: %s",
+             pdf_path, page_index + 1, dpi, max_megapixels, include_annots)
 
     if not os.path.isfile(pdf_path):
         raise RasterizeError(f"PDF file not found: {pdf_path}")
@@ -152,7 +141,7 @@ def pdf_page_to_array_safe(pdf_path, page_index, dpi, max_megapixels=120.0,
         LOG.debug("PDF size (pt): width=%.2f, height=%.2f", rect.width, rect.height)
 
         eff_scale, out_w, out_h, eff_dpi = _compute_scales_for_limits(
-            rect.width, rect.height, dpi, max_megapixels, max_long_side_px
+            rect.width, rect.height, dpi, max_megapixels
         )
         LOG.debug("Final raster size: %d x %d px (eff_dpi=%.1f)", out_w, out_h, eff_dpi)
 
@@ -219,11 +208,11 @@ def compute_affine_transform(colrow_pts, lons, lats):
     return transform, rms_lon, rms_lat, ang_deg
 
 def write_geotiff_from_array(rgb_array, transform, out_tif_path, crs_epsg=4326,
-                             codec='jpeg', jpeg_quality=85, grayscale=False,
+                             codec='jpeg', jpeg_quality=100, grayscale=False,
                              tile_size=512):
     """
     Write a GeoTIFF using the given transform and CRS.
-    codec: 'jpeg', 'deflate' or 'ccittg4'
+    codec: 'jpeg', 'deflate' or 'jpeg2000'
     grayscale: if True and codec == 'deflate', writes 1-band 8-bit (MINISBLACK)
     """
     if rgb_array.ndim != 3 or rgb_array.shape[2] != 3:
@@ -233,17 +222,8 @@ def write_geotiff_from_array(rgb_array, transform, out_tif_path, crs_epsg=4326,
 
     H, W, _ = rgb_array.shape
 
-    # Convert to grayscale if requested (for DEFLATE only)
-    if codec == 'ccittg4':
-        gray = (0.299 * rgb_array[:, :, 0] +
-                0.587 * rgb_array[:, :, 1] +
-                0.114 * rgb_array[:, :, 2]).astype(np.uint8)
-        bw = (gray > 127).astype(np.uint8)
-        count = 1
-        data = bw[np.newaxis, :, :]
-        photometric = 'MINISBLACK'
-        dtype = bw.dtype
-    elif grayscale and codec == 'deflate':
+    # Convert to grayscale if requested
+    if grayscale and codec == 'deflate':
         # ITU-R BT.601 luma
         gray = (0.299 * rgb_array[:, :, 0] +
                 0.587 * rgb_array[:, :, 1] +
@@ -284,16 +264,14 @@ def write_geotiff_from_array(rgb_array, transform, out_tif_path, crs_epsg=4326,
         profile.update({
             'compress': 'deflate',
             'predictor': 2,  # horizontal differencing
-            # zlevel can be set via 'zlevel': 6..9 (rasterio/gdal)
             'zlevel': 7
         })
-    elif codec == 'ccittg4':
+    elif codec == 'jpeg2000':
         profile.update({
-            'compress': 'ccittfax4',
-            'nbits': 1
+            'compress': 'jpeg2000'
         })
     else:
-        raise ValueError("codec must be 'jpeg', 'deflate' or 'ccittg4'.")
+        raise ValueError("codec must be 'jpeg', 'deflate' or 'jpeg2000'.")
 
     with rasterio.open(out_tif_path, 'w', **profile) as dst:
         dst.write(data)
@@ -483,7 +461,6 @@ class GeoRefApp(QMainWindow):
         self.spn_page = QSpinBox(); self.spn_page.setMinimum(1); self.spn_page.setMaximum(1); self.spn_page.setValue(1)
         self.spn_dpi = QSpinBox(); self.spn_dpi.setRange(72, 1200); self.spn_dpi.setValue(300)
         self.spn_maxmp = QSpinBox(); self.spn_maxmp.setRange(10, 600); self.spn_maxmp.setValue(120)  # MP
-        self.spn_maxlong = QSpinBox(); self.spn_maxlong.setRange(2000, 60000); self.spn_maxlong.setValue(15000)  # px
         self.chk_ann = QCheckBox("Include annotations/markups"); self.chk_ann.setChecked(True)
 
         self.btn_raster = QPushButton("Rasterize page → Image")
@@ -493,7 +470,6 @@ class GeoRefApp(QMainWindow):
         f1.addRow(QLabel("Page"), self.spn_page)
         f1.addRow(QLabel("DPI"), self.spn_dpi)
         f1.addRow(QLabel("Max Megapixels"), self.spn_maxmp)
-        f1.addRow(QLabel("Max long side (px)"), self.spn_maxlong)
         f1.addRow(self.chk_ann)
         f1.addRow(self.btn_raster)
         right.addWidget(grp_pdf)
@@ -547,18 +523,14 @@ class GeoRefApp(QMainWindow):
         opt_layout = QFormLayout()
         self.cmb_codec = QComboBox()
         self.cmb_codec.addItems([
-            "JPEG (85%, YCbCr)",
-            "DEFLATE (ZIP, Predictor=2)",
-            "TIFF 1-bit (CCITT Group 4)"
+            "JPEG (100%, YCbCr)",
+            "DEFLATE (8-bit Grayscale)",
+            "DEFLATE (Color)",
+            "JPEG2000"
         ])
-        self.cmb_codec.currentIndexChanged.connect(self._on_codec_changed)
-
-        self.chk_gray = QCheckBox("Grayscale (8-bit)")
-        self.chk_gray.setChecked(False)
-        self.chk_gray.setEnabled(False)  # enabled when DEFLATE is selected
+        self.cmb_codec.currentIndexChanged.connect(self._update_export_info)
 
         opt_layout.addRow(QLabel("Compression"), self.cmb_codec)
-        opt_layout.addRow(self.chk_gray)
 
         self.lbl_result = QLabel("Result: —")
         self.lbl_result.setWordWrap(True)
@@ -658,14 +630,6 @@ class GeoRefApp(QMainWindow):
         self.lbl_epsg.setText(f"EPSG: {self.selected_epsg}")
         LOG.info("Selected CRS: EPSG:%s", self.selected_epsg)
 
-    def _on_codec_changed(self, idx):
-        if idx == 1:
-            self.chk_gray.setEnabled(True)
-        else:
-            self.chk_gray.setChecked(False)
-            self.chk_gray.setEnabled(False)
-        self._update_export_info()
-
     # ------------------- Table headers -------------------
     def _set_table_headers_for_latlon(self):
         self.tbl.setColumnCount(4)
@@ -715,7 +679,6 @@ class GeoRefApp(QMainWindow):
         page_idx = self.spn_page.value() - 1
         dpi = self.spn_dpi.value()
         max_mp = float(self.spn_maxmp.value())
-        max_long = int(self.spn_maxlong.value())
         include_ann = self.chk_ann.isChecked()
 
         # Are we re-rasterizing same PDF/page?
@@ -740,7 +703,7 @@ class GeoRefApp(QMainWindow):
 
         try:
             rgb_arr, eff_dpi = pdf_page_to_array_safe(
-                self.pdf_path, page_idx, dpi, max_mp, include_ann, max_long
+                self.pdf_path, page_idx, dpi, max_mp, include_ann
             )
         except Exception:
             LOG.exception("Rasterization failed")
@@ -1018,14 +981,17 @@ class GeoRefApp(QMainWindow):
                 grayscale = False
             elif idx == 1:
                 codec = 'deflate'
-                grayscale = self.chk_gray.isChecked()
+                grayscale = True
+            elif idx == 2:
+                codec = 'deflate'
+                grayscale = False
             else:
-                codec = 'ccittg4'
+                codec = 'jpeg2000'
                 grayscale = False
 
             write_geotiff_from_array(
                 self._rgb_array, self.transform, out_path,
-                crs_epsg=4326, codec=codec, grayscale=grayscale
+                crs_epsg=4326, codec=codec, grayscale=grayscale, jpeg_quality=100
             )
             QMessageBox.information(
                 self, "Done",
@@ -1050,9 +1016,7 @@ class GeoRefApp(QMainWindow):
         w = self._pixmap.width()
         h = self._pixmap.height()
         bands = 3
-        if self.cmb_codec.currentIndex() == 1 and self.chk_gray.isChecked():
-            bands = 1
-        elif self.cmb_codec.currentIndex() == 2:
+        if self.cmb_codec.currentIndex() == 1:
             bands = 1
         uncmp, est_min, est_max = self._estimate_tif_sizes_mb(w, h, bands=bands)
         txt = (f"Output (image): {w}×{h} px, {bands} band(s), uint8.\n"
